@@ -167,7 +167,7 @@ def pubkey_to_address(pubkey_bytes, addr_type, network='mainnet'):
 VERSION_BYTES = {
     'bip44': {'mainnet': (0x0488ADE4.to_bytes(4, 'big'), 0x0488B21E.to_bytes(4, 'big')),   # xprv / xpub
               'testnet': (0x04358394.to_bytes(4, 'big'), 0x043587CF.to_bytes(4, 'big'))},  # tprv / tpub
-    'bip49': {'mainnet': (0x049D7878.to_bytes(4, 'big'), 0x049D7B9F.to_bytes(4, 'big')),   # yprv / ypub
+    'bip49': {'mainnet': (0x049D7878.to_bytes(4, 'big'), 0x049D7CB2.to_bytes(4, 'big')),   # yprv / ypub
               'testnet': (0x044A4E28.to_bytes(4, 'big'), 0x044A5262.to_bytes(4, 'big'))},  # uprv / upub
     'bip84': {'mainnet': (0x04B2430C.to_bytes(4, 'big'), 0x04B24746.to_bytes(4, 'big')),   # zprv / zpub
               'testnet': (0x045F18BC.to_bytes(4, 'big'), 0x045F1CF6.to_bytes(4, 'big'))},  # vprv / vpub
