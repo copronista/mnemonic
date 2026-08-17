@@ -313,7 +313,7 @@ def bip39_seed_from_mnemonic(mnemonic, passphrase=''):
 
 def electrum_seed_from_mnemonic(mnemonic, passphrase=''):
     clean_phrase = prepare_seed(mnemonic)
-    # L'algoritmo Electrum usa 'electrum' + passphrase come salt per la PBKDF2
+    # Electrum uses 'electrum' + passphrase as the PBKDF2 salt
     return hashlib.pbkdf2_hmac('sha512', clean_phrase.encode('utf-8'), ('electrum' + passphrase).encode('utf-8'), 2048, 64)
 
 # ---------- Address derivation ----------
@@ -345,9 +345,8 @@ def derive_slip39_addresses(master_secret, derivation='bip84', count=20, network
 def derive_electrum_addresses(mnemonic, version='segwit', count=20, network='mainnet', passphrase=''):
     addr_type = 'p2wpkh' if version in ('segwit', '2fa_segwit') else 'p2pkh'
     seed = electrum_seed_from_mnemonic(mnemonic, passphrase)
-    
-    # QUI ERA L'ERRORE: invece di smezzare i byte generati, devono prima passare per HMAC-SHA512
-    # con la chiave "Bitcoin seed" (esattamente come su BIP39/BIP32)
+
+    # The seed must go through HMAC-SHA512 with key "Bitcoin seed" (same as BIP39/BIP32)
     master_key, master_chain = bip32_master_key(seed)
 
     # Electrum seed paths: 'standard' (legacy) derives receiving/change from m/0/i and
@@ -701,174 +700,104 @@ def _crypto_shuffle(lst):
         j = rb % (i + 1)
         lst[i], lst[j] = lst[j], lst[i]
 
-def solve_electrum_mnemonic(partial, wordlist, version='segwit'):
-    """Solve a partial Electrum mnemonic by brute-forcing unknown words (_)."""
+def _parse_partial(partial, wordlist, min_words, radix):
+    """Parse a partial mnemonic into known indices and unknown positions."""
     words = partial.split()
-    if len(words) != 12:
-        raise ValueError(f"Electrum mnemonic must have 12 words, got {len(words)}")
+    if len(words) < min_words:
+        raise ValueError(f"Mnemonic must have at least {min_words} words, got {len(words)}")
     known = {}
     unknown_pos = []
     for i, w in enumerate(words):
         if w == '_':
             unknown_pos.append(i)
         else:
-            wl = [w.lower() for w in wordlist]
             try:
-                known[i] = wl.index(w.lower())
+                known[i] = wordlist.index(w.lower())
             except ValueError:
                 raise ValueError(f"Unknown word: {w!r}")
-    target_prefix = ELECTRUM_VERSIONS[version]
+    return len(words), known, unknown_pos
+
+def _iter_solutions(n, known, unknown_pos, radix, check):
+    """Iterate over candidate index lists, yielding those passing check(indices)."""
     n_unknown = len(unknown_pos)
+    if n_unknown == 0:
+        indices = [known.get(i, 0) for i in range(n)]
+        if check(indices):
+            yield indices
+        return
     if n_unknown == 1:
-        order = list(range(2048))
+        order = list(range(radix))
         _crypto_shuffle(order)
         for widx in order:
-            indices = [0] * 12
+            indices = [0] * n
             for i, idx in known.items():
                 indices[i] = idx
             indices[unknown_pos[0]] = widx
-            val = 0
-            for idx in reversed(indices):
-                val = val * 2048 + idx
-            if val < (2048 ** 11):
-                continue
-            phrase = ' '.join(wordlist[idx] for idx in indices)
-            clean = prepare_seed(phrase)
-            hmac_val = hmac.new(b"Seed version", clean.encode('utf-8'), hashlib.sha512).hexdigest()
-            if hmac_val.startswith(target_prefix):
-                return phrase
-    else:
-        seen = set()
-        total = 2048 ** n_unknown
-        while len(seen) < total:
-            combo = tuple(int.from_bytes(os.urandom(2), 'big') % 2048 for _ in range(n_unknown))
-            if combo in seen:
-                continue
-            seen.add(combo)
-            indices = [0] * 12
-            for i, idx in known.items():
-                indices[i] = idx
-            for i, idx in zip(unknown_pos, combo):
-                indices[i] = idx
-            val = 0
-            for idx in reversed(indices):
-                val = val * 2048 + idx
-            if val < (2048 ** 11):
-                continue
-            phrase = ' '.join(wordlist[idx] for idx in indices)
-            clean = prepare_seed(phrase)
-            hmac_val = hmac.new(b"Seed version", clean.encode('utf-8'), hashlib.sha512).hexdigest()
-            if hmac_val.startswith(target_prefix):
-                return phrase
+            if check(indices):
+                yield indices
+        return
+    seen = set()
+    total = radix ** n_unknown
+    while len(seen) < total:
+        combo = tuple(int.from_bytes(os.urandom(2), 'big') % radix for _ in range(n_unknown))
+        if combo in seen:
+            continue
+        seen.add(combo)
+        indices = [0] * n
+        for i, idx in known.items():
+            indices[i] = idx
+        for i, idx in zip(unknown_pos, combo):
+            indices[i] = idx
+        if check(indices):
+            yield indices
+
+def solve_electrum_mnemonic(partial, wordlist, version='segwit'):
+    """Solve a partial Electrum mnemonic by brute-forcing unknown words (_)."""
+    n, known, unknown_pos = _parse_partial(partial, wordlist, 12, 2048)
+    target_prefix = ELECTRUM_VERSIONS[version]
+    def check(indices):
+        val = 0
+        for idx in reversed(indices):
+            val = val * 2048 + idx
+        if val < (2048 ** 11):
+            return False
+        phrase = ' '.join(wordlist[idx] for idx in indices)
+        clean = prepare_seed(phrase)
+        hmac_val = hmac.new(b"Seed version", clean.encode('utf-8'), hashlib.sha512).hexdigest()
+        return hmac_val.startswith(target_prefix)
+    for indices in _iter_solutions(n, known, unknown_pos, 2048, check):
+        return ' '.join(wordlist[idx] for idx in indices)
     return None
 
 def solve_bip39_mnemonic(partial, wordlist):
     """Solve a partial BIP39 mnemonic by brute-forcing unknown words (_) and checking SHA256 checksum."""
-    words = partial.split()
-    n = len(words)
+    n, known, unknown_pos = _parse_partial(partial, wordlist, 12, 2048)
     if n not in BIP39_WORD_COUNTS:
         raise ValueError(f"BIP39 mnemonic must have {sorted(BIP39_WORD_COUNTS)} words, got {n}")
     entropy_bytes_len = BIP39_WORD_COUNTS[n]
-    total_bits = entropy_bytes_len * 8 + entropy_bytes_len * 8 // 32
     checksum_bits = entropy_bytes_len * 8 // 32
-    known = {}
-    unknown_pos = []
-    for i, w in enumerate(words):
-        if w == '_':
-            unknown_pos.append(i)
-        else:
-            try:
-                known[i] = wordlist.index(w.lower())
-            except ValueError:
-                raise ValueError(f"Unknown word: {w!r}")
-    n_unknown = len(unknown_pos)
-    if n_unknown == 1:
-        order = list(range(2048))
-        _crypto_shuffle(order)
-        for widx in order:
-            indices = [0] * n
-            for i, idx in known.items():
-                indices[i] = idx
-            indices[unknown_pos[0]] = widx
-            value = 0
-            for idx in indices:
-                value = (value << 11) | idx
-            entropy_bits = total_bits - checksum_bits
-            entropy_value = value >> checksum_bits
-            checksum_value = value & ((1 << checksum_bits) - 1)
-            entropy_bytes = entropy_value.to_bytes(entropy_bytes_len, 'big')
-            expected = hashlib.sha256(entropy_bytes).digest()[0] >> (8 - checksum_bits)
-            if checksum_value == expected:
-                return ' '.join(wordlist[idx] for idx in indices)
-    else:
-        seen = set()
-        total = 2048 ** n_unknown
-        while len(seen) < total:
-            combo = tuple(int.from_bytes(os.urandom(2), 'big') % 2048 for _ in range(n_unknown))
-            if combo in seen:
-                continue
-            seen.add(combo)
-            indices = [0] * n
-            for i, idx in known.items():
-                indices[i] = idx
-            for i, idx in zip(unknown_pos, combo):
-                indices[i] = idx
-            value = 0
-            for idx in indices:
-                value = (value << 11) | idx
-            entropy_bits = total_bits - checksum_bits
-            entropy_value = value >> checksum_bits
-            checksum_value = value & ((1 << checksum_bits) - 1)
-            entropy_bytes = entropy_value.to_bytes(entropy_bytes_len, 'big')
-            expected = hashlib.sha256(entropy_bytes).digest()[0] >> (8 - checksum_bits)
-            if checksum_value == expected:
-                return ' '.join(wordlist[idx] for idx in indices)
+    def check(indices):
+        value = 0
+        for idx in indices:
+            value = (value << 11) | idx
+        entropy_value = value >> checksum_bits
+        checksum_value = value & ((1 << checksum_bits) - 1)
+        entropy_bytes = entropy_value.to_bytes(entropy_bytes_len, 'big')
+        expected = hashlib.sha256(entropy_bytes).digest()[0] >> (8 - checksum_bits)
+        return checksum_value == expected
+    for indices in _iter_solutions(n, known, unknown_pos, 2048, check):
+        return ' '.join(wordlist[idx] for idx in indices)
     return None
 
 def solve_slip39_mnemonic(partial, wordlist):
     """Solve a partial SLIP-39 mnemonic by brute-forcing unknown words (_) and checking RS1024 checksum."""
-    words = partial.split()
-    n = len(words)
-    if n < 20:
-        raise ValueError(f"SLIP-39 share must have at least 20 words, got {n}")
-    known = {}
-    unknown_pos = []
-    for i, w in enumerate(words):
-        if w == '_':
-            unknown_pos.append(i)
-        else:
-            try:
-                known[i] = wordlist.index(w.lower())
-            except ValueError:
-                raise ValueError(f"Unknown word: {w!r}")
+    n, known, unknown_pos = _parse_partial(partial, wordlist, 20, 1024)
     id_ext_exp = _slip39_int_from_indices([known.get(0, 0), known.get(1, 0)])
     cs = SLIP39_CUSTOMIZATION_STRING_EXTENDABLE if (id_ext_exp >> 4) & 1 else SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE
-    n_unknown = len(unknown_pos)
-    if n_unknown == 1:
-        order = list(range(1024))
-        _crypto_shuffle(order)
-        for widx in order:
-            indices = [0] * n
-            for i, idx in known.items():
-                indices[i] = idx
-            indices[unknown_pos[0]] = widx
-            if rs1024_verify_checksum(cs, indices):
-                return ' '.join(wordlist[idx] for idx in indices)
-    else:
-        seen = set()
-        total = 1024 ** n_unknown
-        while len(seen) < total:
-            combo = tuple(int.from_bytes(os.urandom(2), 'big') % 1024 for _ in range(n_unknown))
-            if combo in seen:
-                continue
-            seen.add(combo)
-            indices = [0] * n
-            for i, idx in known.items():
-                indices[i] = idx
-            for i, idx in zip(unknown_pos, combo):
-                indices[i] = idx
-            if rs1024_verify_checksum(cs, indices):
-                return ' '.join(wordlist[idx] for idx in indices)
+    def check(indices):
+        return rs1024_verify_checksum(cs, indices)
+    for indices in _iter_solutions(n, known, unknown_pos, 1024, check):
+        return ' '.join(wordlist[idx] for idx in indices)
     return None
 
 def main():
@@ -935,10 +864,14 @@ def main():
             print(f"Solved mnemonic: {solved}")
         args.mnemonic = solved
         args.bitsmnemonic = None
+    else:
+        wordlist = None
+        slip_wordlist = None
 
     if args.type == 'slip39':
-        slip_fallback = slip39_bundled_wordlist_path() if args.slip39_wordlist == 'slip39_english.txt' else None
-        slip_wordlist = slip39_load_wordlist(args.slip39_wordlist, fallback=slip_fallback)
+        if slip_wordlist is None:
+            slip_fallback = slip39_bundled_wordlist_path() if args.slip39_wordlist == 'slip39_english.txt' else None
+            slip_wordlist = slip39_load_wordlist(args.slip39_wordlist, fallback=slip_fallback)
 
         if args.slip39_recover:
             ms = slip39_recover(args.slip39_recover, args.passphrase, slip_wordlist)
@@ -966,8 +899,9 @@ def main():
             result['wallet'] = {k: v for k, v in wallet.items() if k != 'addresses'}
             result['addresses'] = wallet['addresses']
     else:
-        fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
-        wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
+        if wordlist is None:
+            fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
+            wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
         solved = getattr(args, 'mnemonic', None)
 
         if solved:
@@ -1022,7 +956,6 @@ def main():
 
 def _parse_entropy_note(note, hex_str):
     """Parse '128/132 bits (from --bitshex, 128 user + 4 random)' into structured dict."""
-    import re
     m = re.match(r'(\d+)/(\d+) bits \(([^)]+)\)', note)
     if not m:
         return {'hex': hex_str, 'user_bits': 0, 'required_bits': 0, 'source': '', 'detail': ''}
