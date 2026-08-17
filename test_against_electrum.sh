@@ -22,6 +22,9 @@
 #   BIP39_WORDS     BIP39 word count 12|15|18|21|24 (default: 24); if changed,
 #                   BITS must match the corresponding entropy size
 #                   (128/160/192/224/256 bits)
+#   SLIP39_WORDS    SLIP-39 master secret size in words 12|24 (default: 24)
+#   SLIP39_BITS     deterministic entropy for the SLIP-39 cases (default: 32
+#                   zero bytes = 256 bits; 16 bytes for 12 words)
 #
 # Notes:
 #   - `--type electrum` mnemonics are imported with the daemon `restore` command.
@@ -30,6 +33,8 @@
 #     builds the wallet with Electrum's own wizard code path
 #     (electrum_bip39_restore.py) and then loads it into the daemon. The
 #     receiving addresses still come from the daemon via `listaddresses`.
+#   - `--type slip39` shares go through the same wizard code path
+#     (electrum_slip39_restore.py: slip39.recover_ems + from_bip43_rootseed).
 #   - Electrum 2FA seeds cannot be restored as single-key wallets (they are
 #     2-of-3 multisig with a trusted cosigner server) and are skipped.
 set -euo pipefail
@@ -40,11 +45,14 @@ ELECTRUM_BIN="${ELECTRUM_BIN:-$ELECTRUM_REPO/env/bin/electrum}"
 ELECTRUM_PYTHON="${ELECTRUM_PYTHON:-$ELECTRUM_REPO/env/bin/python}"
 MNEMONIC_PY="${MNEMONIC_PY:-$SCRIPT_DIR/mnemonic.py}"
 BIP39_HELPER="$SCRIPT_DIR/electrum_bip39_restore.py"
+SLIP39_HELPER="$SCRIPT_DIR/electrum_slip39_restore.py"
 NETWORK="${NETWORK:-mainnet}"
 COUNT="${COUNT:-5}"
 BIP39_WORDS="${BIP39_WORDS:-24}"
+SLIP39_WORDS="${SLIP39_WORDS:-24}"
 BITS="${BITS:-$(printf '00%.0s' $(seq 1 32))}"
 ELECTRUM_BITS="${ELECTRUM_BITS:-$(printf '00%.0s' $(seq 1 32))}"
+SLIP39_BITS="${SLIP39_BITS:-$(printf '00%.0s' $(seq 1 32))}"
 
 if [[ ! -x "$ELECTRUM_BIN" ]]; then
     echo "error: Electrum binary not found at $ELECTRUM_BIN (set ELECTRUM_REPO or ELECTRUM_BIN)" >&2
@@ -124,6 +132,9 @@ BITS_FLAGS=(--bitshex "$BITS")
 ELECTRUM_BITS_FLAGS=(--bitshex "$ELECTRUM_BITS")
 BIP39_WORDS_FLAGS=(--bip39-words "$BIP39_WORDS")
 
+SLIP39_BITS_FLAGS=(--bitshex "$SLIP39_BITS")
+SLIP39_WORDS_FLAGS=(--slip39-words "$SLIP39_WORDS")
+
 # ---------- Electrum-type mnemonics (daemon `restore`) ----------
 
 run_electrum_case() {
@@ -180,6 +191,40 @@ fi
 run_bip39_case bip44 "m/44h/${COIN}h/0h"
 run_bip39_case bip49 "m/49h/${COIN}h/0h"
 run_bip39_case bip84 "m/84h/${COIN}h/0h"
+
+# ---------- SLIP-39 mnemonics (wizard code path + daemon load_wallet) ----------
+
+run_slip39_case() {
+    local name="$1" derivation="$2"
+    local out ms shares
+    out="$("$ELECTRUM_PYTHON" "$MNEMONIC_PY" --type slip39 --slip39-shares 3 --slip39-threshold 2 \
+        "${SLIP39_BITS_FLAGS[@]}" "${SLIP39_WORDS_FLAGS[@]}" \
+        --count "$COUNT" --network "$NETWORK" \
+        --wordlist-file "$SCRIPT_DIR/english.txt" \
+        --slip39-wordlist "$SCRIPT_DIR/slip39_english.txt" 2>/dev/null)"
+    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret ([^)]*): //p')"
+    mapfile -t share_lines < <(printf '%s\n' "$out" | sed -n 's/^  Share [0-9][0-9]*: //p')
+    printf '%s\n' "$out" | sed -n 's/^ *[0-9][0-9]*: //p' >"$ELDIR/expected"
+    if [[ -z "$ms" || "${#share_lines[@]}" -ne 3 ]]; then
+        FAIL=$((FAIL + 1))
+        echo "FAIL: slip39/$name (could not parse script output)"
+        return
+    fi
+    local wallet="$WALLETS/slip39_$name"
+    ELECTRUMDIR="$ELDIR" "$ELECTRUM_PYTHON" "$SLIP39_HELPER" \
+        --mnemonic "${share_lines[0]}" \
+        --mnemonic "${share_lines[1]}" \
+        --derivation "$derivation" \
+        --chain "$NETWORK" \
+        --electrum-path "$ELDIR" \
+        --wallet "$wallet"
+    el load_wallet -w "$wallet" >/dev/null
+    el listaddresses --receiving -w "$wallet" | \
+        "$ELECTRUM_PYTHON" -c 'import json,sys; print("\n".join(json.load(sys.stdin)[:int(sys.argv[1])]))' "$COUNT" >"$ELDIR/actual"
+    report "slip39/$name ($NETWORK)" "$ELDIR/expected" "$ELDIR/actual"
+}
+
+run_slip39_case bip84 "m/84h/${COIN}h/0h"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

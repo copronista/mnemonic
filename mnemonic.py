@@ -316,15 +316,14 @@ def electrum_seed_from_mnemonic(mnemonic, passphrase=''):
     return hashlib.pbkdf2_hmac('sha512', clean_phrase.encode('utf-8'), ('electrum' + passphrase).encode('utf-8'), 2048, 64)
 
 # ---------- Address derivation ----------
-def derive_bip39_addresses(mnemonic, derivation='bip84', count=20, network='mainnet'):
-    seed = bip39_seed_from_mnemonic(mnemonic)
+def derive_bip32_wallet(seed, derivation='bip84', count=20, network='mainnet'):
     master_key, master_chain = bip32_master_key(seed)
 
     if derivation == 'bip44':
         purpose, addr_type = 44, 'p2pkh'
     elif derivation == 'bip49':
         purpose, addr_type = 49, 'p2sh-p2wpkh'
-    elif derivation == 'bip84':
+    else:
         purpose, addr_type = 84, 'p2wpkh'
     coin_type = 1 if network != 'mainnet' else 0
     path = [purpose | 0x80000000, coin_type | 0x80000000, 0x80000000]
@@ -335,9 +334,16 @@ def derive_bip39_addresses(mnemonic, derivation='bip84', count=20, network='main
     addresses = [pubkey_to_address(pubkey_from_privkey(bip32_child_private(ext_key, ext_chain, i)[0]), addr_type, network) for i in range(count)]
     return addresses, master_key, master_chain, account_key, account_chain, path
 
-def derive_electrum_addresses(mnemonic, version='segwit', count=20, network='mainnet'):
+def derive_bip39_addresses(mnemonic, derivation='bip84', count=20, network='mainnet', passphrase=''):
+    seed = bip39_seed_from_mnemonic(mnemonic, passphrase)
+    return derive_bip32_wallet(seed, derivation, count, network)
+
+def derive_slip39_addresses(master_secret, derivation='bip84', count=20, network='mainnet'):
+    return derive_bip32_wallet(master_secret, derivation, count, network)
+
+def derive_electrum_addresses(mnemonic, version='segwit', count=20, network='mainnet', passphrase=''):
     addr_type = 'p2wpkh' if version in ('segwit', '2fa_segwit') else 'p2pkh'
-    seed = electrum_seed_from_mnemonic(mnemonic)
+    seed = electrum_seed_from_mnemonic(mnemonic, passphrase)
     
     # QUI ERA L'ERRORE: invece di smezzare i byte generati, devono prima passare per HMAC-SHA512
     # con la chiave "Bitcoin seed" (esattamente come su BIP39/BIP32)
@@ -356,10 +362,287 @@ def derive_electrum_addresses(mnemonic, version='segwit', count=20, network='mai
     addresses = [pubkey_to_address(pubkey_from_privkey(bip32_child_private(receiving_key, receiving_chain, i)[0]), addr_type, network) for i in range(count)]
     return addresses, master_key, master_chain, receiving_key, receiving_chain, [0]
 
+# ---------- SLIP-39 (Shamir's Secret-Sharing for Mnemonic Codes) ----------
+# Implements the SLIP-0039 spec: GF(256) Shamir secret sharing, RS1024 checksum,
+# Feistel encryption of the master secret, and two-level (group) sharing.
+SLIP39_RADIX_BITS = 10
+SLIP39_SECRET_INDEX = 255
+SLIP39_DIGEST_INDEX = 254
+SLIP39_BASE_ITERATION_COUNT = 10000
+SLIP39_ROUND_COUNT = 4
+SLIP39_ID_LENGTH_BITS = 15
+SLIP39_ITERATION_EXP_LENGTH_BITS = 4
+SLIP39_EXTENDABLE_FLAG_LENGTH_BITS = 1
+SLIP39_INDEX_LENGTH_BITS = 4
+SLIP39_CHECKSUM_LENGTH_WORDS = 3
+SLIP39_DIGEST_LENGTH_BYTES = 4
+SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE = b"shamir"
+SLIP39_CUSTOMIZATION_STRING_EXTENDABLE = b"shamir_extendable"
+SLIP39_WORD_COUNTS = {12: 16, 24: 32}
+SLIP39_RS1024_GEN = (0xE0E040, 0x1C1C080, 0x3838100, 0x7070200, 0xE0E0009, 0x1C0C2412, 0x38086C24, 0x3090FC48, 0x21B1F890, 0x3F3F120)
+
+def _gf256_precompute():
+    exp = [0] * 255
+    log = [0] * 256
+    poly = 1
+    for i in range(255):
+        exp[i] = poly
+        log[poly] = i
+        poly = (poly << 1) ^ poly  # multiply by the generator (x + 1)
+        if poly & 0x100:
+            poly ^= 0x11B
+    return exp, log
+
+_GF_EXP, _GF_LOG = _gf256_precompute()
+
+def gf256_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return _GF_EXP[(_GF_LOG[a] + _GF_LOG[b]) % 255]
+
+def rs1024_polymod(values):
+    chk = 1
+    for v in values:
+        b = chk >> 20
+        chk = (chk & 0xFFFFF) << 10 ^ v
+        for i in range(10):
+            chk ^= SLIP39_RS1024_GEN[i] if ((b >> i) & 1) else 0
+    return chk
+
+def rs1024_verify_checksum(cs, data):
+    return rs1024_polymod(list(cs) + data) == 1
+
+def rs1024_create_checksum(cs, data):
+    values = list(cs) + data
+    polymod = rs1024_polymod(values + [0, 0, 0]) ^ 1
+    return [(polymod >> 10 * (2 - i)) & 1023 for i in range(3)]
+
+def _slip39_int_from_indices(indices):
+    value = 0
+    for index in indices:
+        value = (value << SLIP39_RADIX_BITS) + index
+    return value
+
+def _slip39_int_to_indices(value, output_length, bits=SLIP39_RADIX_BITS):
+    mask = (1 << bits) - 1
+    return [(value >> (i * bits)) & mask for i in reversed(range(output_length))]
+
+def slip39_load_wordlist(path, fallback=None):
+    for candidate in [path] + ([fallback] if fallback else []):
+        try:
+            with open(candidate, 'r', encoding='utf-8') as f:
+                words = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            continue
+        if len(words) != 1024:
+            raise ValueError(f"SLIP-39 wordlist '{candidate}' must contain exactly 1024 words, found {len(words)}")
+        return words
+    print(f"Error: SLIP-39 wordlist file '{path}' not found.", file=sys.stderr)
+    sys.exit(1)
+
+def slip39_bundled_wordlist_path():
+    if getattr(sys, 'frozen', False):
+        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+        return os.path.join(base, 'slip39_english.txt')
+    return None
+
+def slip39_split_secret(threshold, share_count, secret):
+    """Split a secret into `share_count` shares with `threshold` needed to recover."""
+    if not (1 <= threshold <= share_count <= 16):
+        raise ValueError("Invalid SLIP-39 share scheme: 1 <= threshold <= share_count <= 16")
+    if len(secret) * 8 < 128 or len(secret) * 8 % 16 != 0:
+        raise ValueError("Invalid SLIP-39 master secret length (must be a multiple of 128 bits)")
+    if threshold == 1:
+        return [secret] * share_count
+    random_part = random_entropy_bytes(len(secret) - SLIP39_DIGEST_LENGTH_BYTES)
+    digest = hmac.new(random_part, secret, hashlib.sha256).digest()[:SLIP39_DIGEST_LENGTH_BYTES]
+    digest_value = digest + random_part
+    random_shares = [random_entropy_bytes(len(secret)) for _ in range(threshold - 2)]
+    points = list(enumerate(random_shares)) + [
+        (SLIP39_DIGEST_INDEX, digest_value),
+        (SLIP39_SECRET_INDEX, secret),
+    ]
+    shares = list(random_shares)
+    for i in range(threshold - 2, share_count):
+        shares.append(slip39_interpolate(points, i))
+    return shares
+
+def slip39_interpolate(points, x):
+    """Lagrange interpolation over GF(256); points is a list of (x_index, value_bytes)."""
+    for px, py in points:
+        if px == x:
+            return py
+    length = len(points[0][1])
+    log_prod = sum(_GF_LOG[px ^ x] for px, _ in points)
+    result = bytes(length)
+    for px, py in points:
+        log_basis_eval = (log_prod - _GF_LOG[px ^ x] - sum(_GF_LOG[px ^ ox] for ox, _ in points)) % 255
+        result = bytes(
+            acc ^ (_GF_EXP[(_GF_LOG[val] + log_basis_eval) % 255] if val != 0 else 0)
+            for val, acc in zip(py, result)
+        )
+    return result
+
+def slip39_recover_secret(threshold, shares):
+    """Recover a shared secret from `shares` (list of (x_index, value_bytes))."""
+    if threshold == 1:
+        return shares[0][1]
+    secret = slip39_interpolate(shares, SLIP39_SECRET_INDEX)
+    digest_share = slip39_interpolate(shares, SLIP39_DIGEST_INDEX)
+    digest = digest_share[:SLIP39_DIGEST_LENGTH_BYTES]
+    random_part = digest_share[SLIP39_DIGEST_LENGTH_BYTES:]
+    if digest != hmac.new(random_part, secret, hashlib.sha256).digest()[:SLIP39_DIGEST_LENGTH_BYTES]:
+        raise ValueError("Invalid digest: the recovered SLIP-39 secret failed verification.")
+    return secret
+
+def slip39_round_function(i, passphrase_bytes, iteration_exponent, salt, r):
+    iterations = (SLIP39_BASE_ITERATION_COUNT << iteration_exponent) // SLIP39_ROUND_COUNT
+    return hashlib.pbkdf2_hmac('sha256', bytes([i]) + passphrase_bytes, salt + r, iterations, len(r))
+
+def slip39_encrypt_master_secret(master_secret, passphrase, iteration_exponent, identifier, extendable=True):
+    half = len(master_secret) // 2
+    l, r = master_secret[:half], master_secret[half:]
+    passphrase_bytes = passphrase.encode('utf-8')
+    salt = b'' if extendable else SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE + identifier.to_bytes(2, 'big')
+    for i in range(SLIP39_ROUND_COUNT):
+        l, r = r, bytes(x ^ y for x, y in zip(l, slip39_round_function(i, passphrase_bytes, iteration_exponent, salt, r)))
+    return r + l
+
+def slip39_decrypt_master_secret(ems, passphrase, iteration_exponent, identifier, extendable):
+    half = len(ems) // 2
+    l, r = ems[:half], ems[half:]
+    passphrase_bytes = passphrase.encode('utf-8')
+    salt = b'' if extendable else SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE + identifier.to_bytes(2, 'big')
+    for i in reversed(range(SLIP39_ROUND_COUNT)):
+        l, r = r, bytes(x ^ y for x, y in zip(l, slip39_round_function(i, passphrase_bytes, iteration_exponent, salt, r)))
+    return r + l
+
+def slip39_encode_share(identifier, extendable, iteration_exponent, group_index, group_threshold, group_count, member_index, member_threshold, share_value, wordlist):
+    value_bits = len(share_value) * 8
+    word_count = (value_bits + SLIP39_RADIX_BITS - 1) // SLIP39_RADIX_BITS
+    value_int = int.from_bytes(share_value, 'big')
+    value_words = [(value_int >> (SLIP39_RADIX_BITS * i)) & 1023 for i in reversed(range(word_count))]
+
+    metadata = (identifier << 25) | (int(extendable) << 24) | (iteration_exponent << 20) \
+        | (group_index << 16) | ((group_threshold - 1) << 12) | ((group_count - 1) << 8) \
+        | (member_index << 4) | (member_threshold - 1)
+    metadata_words = [(metadata >> (10 * i)) & 1023 for i in reversed(range(4))]
+
+    data = metadata_words + value_words
+    cs = SLIP39_CUSTOMIZATION_STRING_EXTENDABLE if extendable else SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE
+    words = [wordlist[w] for w in data + rs1024_create_checksum(cs, data)]
+    return ' '.join(words)
+
+def slip39_decode_share(mnemonic, wordlist):
+    indices = []
+    for word in mnemonic.split():
+        try:
+            indices.append(wordlist.index(word.lower()))
+        except ValueError:
+            raise ValueError(f"Invalid SLIP-39 word: {word!r}") from None
+    if len(indices) < 20:
+        raise ValueError(f"SLIP-39 share too short ({len(indices)} words); expected at least 20")
+
+    id_ext_exp = _slip39_int_from_indices(indices[:2])
+    cs = SLIP39_CUSTOMIZATION_STRING_EXTENDABLE if (id_ext_exp >> 4) & 1 else SLIP39_CUSTOMIZATION_STRING_NON_EXTENDABLE
+    if not rs1024_verify_checksum(cs, indices):
+        raise ValueError("Invalid SLIP-39 checksum.")
+
+    meta = _slip39_int_from_indices(indices[2:4])
+    return {
+        'identifier': id_ext_exp >> 5,
+        'extendable': bool((id_ext_exp >> 4) & 1),
+        'iteration_exponent': id_ext_exp & 0xF,
+        'group_index': meta >> 16,
+        'group_threshold': ((meta >> 12) & 0xF) + 1,
+        'group_count': ((meta >> 8) & 0xF) + 1,
+        'member_index': (meta >> 4) & 0xF,
+        'member_threshold': (meta & 0xF) + 1,
+        'value': _slip39_decode_value(indices[4:-SLIP39_CHECKSUM_LENGTH_WORDS]),
+    }
+
+def _slip39_decode_value(value_data):
+    padding_len = (SLIP39_RADIX_BITS * len(value_data)) % 16
+    if padding_len > 8:
+        raise ValueError("Invalid SLIP-39 share length.")
+    if value_data[0] >= (1 << (SLIP39_RADIX_BITS - padding_len)):
+        raise ValueError("Invalid SLIP-39 padding.")
+    value_byte_count = (SLIP39_RADIX_BITS * len(value_data) - padding_len) // 8
+    return _slip39_int_from_indices(value_data).to_bytes(value_byte_count, 'big')
+
+def slip39_generate_shares(master_secret, passphrase, group_threshold, group_count, member_threshold, member_count, wordlist, iteration_exponent=0, extendable=True):
+    if not (1 <= member_threshold <= member_count <= 16):
+        raise ValueError("Invalid SLIP-39 member scheme: 1 <= member_threshold <= member_count <= 16")
+    if not (1 <= group_threshold <= group_count <= 16):
+        raise ValueError("Invalid SLIP-39 group scheme: 1 <= group_threshold <= group_count <= 16")
+    if member_threshold == 1 and member_count > 1:
+        raise ValueError("A 1-of-N SLIP-39 group must have exactly one member share")
+    if not all(32 <= ord(c) <= 126 for c in passphrase):
+        raise ValueError("SLIP-39 passphrase must contain only printable ASCII characters")
+    identifier = int.from_bytes(random_entropy_bytes(2), 'big') & 0x7FFF
+    ems = slip39_encrypt_master_secret(master_secret, passphrase, iteration_exponent, identifier, extendable)
+    group_secrets = slip39_split_secret(group_threshold, group_count, ems)
+    shares = []
+    for gi in range(group_count):
+        member_secrets = slip39_split_secret(member_threshold, member_count, group_secrets[gi])
+        for mi in range(member_count):
+            shares.append(slip39_encode_share(
+                identifier, extendable, iteration_exponent, gi, group_threshold, group_count,
+                mi, member_threshold, member_secrets[mi], wordlist))
+    return shares
+
+def slip39_recover(shares, passphrase, wordlist):
+    parsed = [slip39_decode_share(s, wordlist) for s in shares]
+    common = {(p['identifier'], p['extendable'], p['iteration_exponent'], p['group_threshold'], p['group_count']) for p in parsed}
+    if len(common) != 1:
+        raise ValueError("SLIP-39 shares do not share the same identifier and scheme")
+    identifier, extendable, iteration_exponent, group_threshold, _ = next(iter(common))
+
+    groups = {}
+    for p in parsed:
+        if p['group_count'] < p['group_threshold']:
+            raise ValueError("SLIP-39 share declares fewer groups than its group threshold")
+        group = groups.setdefault(p['group_index'], (p['member_threshold'], []))
+        if group[0] != p['member_threshold']:
+            raise ValueError("SLIP-39 shares within a group must have the same member threshold")
+        group[1].append((p['member_index'], p['value']))
+    for gi, (member_threshold, members) in groups.items():
+        if len({m for m, _ in members}) != len(members):
+            raise ValueError(f"Duplicate SLIP-39 member share index in group {gi}")
+        if len(members) < member_threshold:
+            raise ValueError(f"Insufficient SLIP-39 shares in group {gi}: need {member_threshold}, got {len(members)}")
+
+    full_groups = {gi: (mt, members) for gi, (mt, members) in groups.items() if len(members) >= mt}
+    if len(full_groups) < group_threshold:
+        raise ValueError(f"Insufficient SLIP-39 groups: need {group_threshold}, got {len(full_groups)}")
+
+    group_secrets = [(gi, slip39_recover_secret(mt, members)) for gi, (mt, members) in full_groups.items()]
+    ems = slip39_recover_secret(group_threshold, group_secrets)
+    return slip39_decrypt_master_secret(ems, passphrase, iteration_exponent, identifier, extendable)
+
+def print_bip32_wallet(seed, derivation, network, passphrase, count, type_label, entropy_label, entropy_note, entropy_hex):
+    """Derive and print the BIP32 wallet for a seed (BIP39 seed or SLIP-39 master secret)."""
+    addresses, master_key, master_chain, account_key, account_chain, path = derive_bip32_wallet(seed, derivation, count, network)
+    script = {'bip44': 'p2pkh', 'bip49': 'p2sh-segwit', 'bip84': 'segwit'}[derivation]
+    pp = 'none' if not passphrase else '<set>'
+    print(f"\nWallet: {type_label} {derivation} ({script}) | network {network} | passphrase: {pp}")
+    print(f"  Derivation: receiving {format_path(path + [0])}/i | change {format_path(path + [1])}/i")
+    print(f"  {entropy_label} {entropy_note}: {entropy_hex}")
+
+    net_key = 'testnet' if network != 'mainnet' else 'mainnet'
+    v_prv, v_pub = VERSION_BYTES.get(derivation, VERSION_BYTES['default'])[net_key]
+    parent_key, parent_chain = bip32_derive_path(master_key, master_chain, path[:-1])
+    account_parent_fp = bip32_fingerprint_from_privkey(parent_key)
+    account_xprv = bip32_xprv(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_prv)
+    account_xpub = bip32_xpub(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_pub)
+    print(f"\nAccount xprv (depth {len(path)}):", account_xprv)
+    print(f"Account xpub (depth {len(path)}):", account_xpub)
+    return addresses
+
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate an Electrum or BIP39 mnemonic and derive its first receiving addresses and extended keys.',
+        description='Generate an Electrum, BIP39 or SLIP-39 mnemonic and derive its first receiving addresses and extended keys.',
         epilog='Entropy inputs shorter than the required size get random bits appended; longer ones are truncated. '
                'Without any --bits* option, random entropy is used.')
     entropy_group = parser.add_mutually_exclusive_group()
@@ -367,78 +650,75 @@ def main():
     entropy_group.add_argument('--bits6', help='base-6 digits, e.g. "2103"')
     entropy_group.add_argument('--bitsphrase', help='UTF-8 text encoded as its bytes')
     entropy_group.add_argument('--bitshex', help='hex digits, optional 0x prefix, e.g. "0x1a2b"')
-    parser.add_argument('--type', required=True, choices=['electrum', 'bip39'], help='mnemonic algorithm')
+    parser.add_argument('--type', required=True, choices=['electrum', 'bip39', 'slip39'], help='mnemonic algorithm')
     parser.add_argument('--electrum-version', default='segwit', choices=ELECTRUM_VERSIONS.keys(), help='Electrum seed version')
     parser.add_argument('--bip39-derivation', default='bip84', choices=['bip44', 'bip49', 'bip84'], help='derivation scheme; sets key versions and address type')
     parser.add_argument('--bip39-words', type=int, default=24, choices=sorted(BIP39_WORD_COUNTS), help='word count; sets entropy size (BIP39 only)')
     parser.add_argument('--network', default='mainnet', choices=NETWORKS.keys(), help='network the addresses and keys are derived for')
     parser.add_argument('--wordlist-file', default='english.txt', help='2048-word list used for encoding')
     parser.add_argument('--count', type=int, default=20, help='number of receiving addresses to display')
+    parser.add_argument('--passphrase', default='', help='BIP39/SLIP-39 passphrase or Electrum extension word; shown as "<set>" when given')
+    parser.add_argument('--slip39-words', type=int, default=24, choices=sorted(SLIP39_WORD_COUNTS), help='master secret size in words (12 = 128 bits, 24 = 256 bits)')
+    parser.add_argument('--slip39-shares', type=int, default=3, help='number of member shares to generate')
+    parser.add_argument('--slip39-threshold', type=int, default=2, help='member shares needed to recover a group')
+    parser.add_argument('--slip39-groups', type=int, default=1, help='number of groups (1 = no group sharing)')
+    parser.add_argument('--slip39-group-threshold', type=int, default=1, help='groups needed to recover the master secret')
+    parser.add_argument('--slip39-wordlist', default='slip39_english.txt', help='1024-word SLIP-39 list used for encoding')
+    parser.add_argument('--slip39-recover', action='append', default=None, metavar='MNEMONIC',
+                        help='recover a master secret from a SLIP-39 share; repeat for each share')
     args = parser.parse_args()
+
+    if args.type == 'slip39':
+        slip_fallback = slip39_bundled_wordlist_path() if args.slip39_wordlist == 'slip39_english.txt' else None
+        slip_wordlist = slip39_load_wordlist(args.slip39_wordlist, fallback=slip_fallback)
+
+        if args.slip39_recover:
+            ms = slip39_recover(args.slip39_recover, args.passphrase, slip_wordlist)
+            print(f"Recovered SLIP-39 master secret from {len(args.slip39_recover)} shares:")
+            print(f"  Master secret: {ms.hex()}")
+            addresses = print_bip32_wallet(ms, args.bip39_derivation, args.network, args.passphrase, args.count,
+                                           'SLIP-39', 'Master secret', f"({len(ms) * 8} bits, from shares)", ms.hex())
+        else:
+            required_bits = SLIP39_WORD_COUNTS.get(args.slip39_words, 32) * 8
+            entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
+            shares = slip39_generate_shares(entropy_bytes, args.passphrase, args.slip39_group_threshold,
+                                            args.slip39_groups, args.slip39_threshold, args.slip39_shares, slip_wordlist)
+            scheme = f"{args.slip39_threshold}-of-{args.slip39_shares}"
+            if args.slip39_groups > 1:
+                scheme = f"{args.slip39_group_threshold}-of-{args.slip39_groups} groups, each {scheme}"
+            print(f"Mnemonic (SLIP-39 {scheme}):")
+            for i, s in enumerate(shares, 1):
+                print(f"  Share {i}: {s}")
+            addresses = print_bip32_wallet(entropy_bytes, args.bip39_derivation, args.network, args.passphrase, args.count,
+                                           'SLIP-39', 'Master secret', entropy_note, entropy_bytes.hex())
+        if addresses:
+            print("\nFirst %d addresses:" % len(addresses))
+            for i, addr in enumerate(addresses): print(f"{i:2d}: {addr}")
+        return
 
     fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
     wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
     required_bits = BIP39_WORD_COUNTS.get(args.bip39_words, 32) * 8 if args.type == 'bip39' else 256
-    if args.bits is not None:
-        user_value, user_bits, source = *binary_to_bits(args.bits), '--bits'
-    elif args.bits6 is not None:
-        user_value, user_bits, source = *base6_to_bits(args.bits6), '--bits6'
-    elif args.bitsphrase is not None:
-        user_value, user_bits, source = *phrase_to_bits(args.bitsphrase), '--bitsphrase'
-    elif args.bitshex is not None:
-        user_value, user_bits, source = *hex_to_bits(args.bitshex), '--bitshex'
-    else:
-        user_value, user_bits, source = None, 0, None
-
-    if user_value is None:
-        entropy_bytes = random_entropy_bytes(required_bits // 8)
-        entropy_note = f"({required_bits} bits, /dev/random)"
-    else:
-        if user_bits == required_bits:
-            entropy_value = user_value
-            note = f"{user_bits} user bits"
-        else:
-            entropy_value = complete_entropy(user_value, user_bits, required_bits)
-            if user_bits > required_bits:
-                note = f"truncated from {user_bits} to {required_bits} bits"
-            else:
-                note = f"{user_bits} user bits + {required_bits - user_bits} random bits"
-        entropy_bytes = entropy_value.to_bytes(required_bits // 8, 'big')
-        entropy_note = f"({required_bits} bits, from {source}, {note})"
+    entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
     net_key = 'testnet' if args.network != 'mainnet' else 'mainnet'
 
     if args.type == 'bip39':
         mnemonic = bip39_mnemonic(entropy_bytes, wordlist)
         print("Mnemonic (BIP39):", mnemonic)
-        addresses, master_key, master_chain, account_key, account_chain, path = derive_bip39_addresses(mnemonic, args.bip39_derivation, args.count, args.network)
-
-        script = {'bip44': 'p2pkh', 'bip49': 'p2sh-segwit', 'bip84': 'segwit'}[args.bip39_derivation]
-        print(f"\nWallet: BIP39 {args.bip39_derivation} ({script}) | network {args.network} | passphrase: none")
-        print(f"  Derivation: receiving {format_path(path + [0])}/i | change {format_path(path + [1])}/i")
-        print(f"  Entropy {entropy_note}: {entropy_bytes.hex()}")
-
-        v_prv, v_pub = VERSION_BYTES.get(args.bip39_derivation, VERSION_BYTES['default'])[net_key]
-        master_xprv = bip32_xprv(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=VERSION_BYTES['bip44'][net_key][0])
-        master_xpub = bip32_xpub(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=VERSION_BYTES['bip44'][net_key][1])
-        
-        parent_key, parent_chain = bip32_derive_path(master_key, master_chain, path[:-1])
-        account_parent_fp = bip32_fingerprint_from_privkey(parent_key)
-        
-        account_xprv = bip32_xprv(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_prv)
-        account_xpub = bip32_xpub(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_pub)
-        
-        print(f"\nAccount xprv (depth {len(path)}):", account_xprv)
-        print(f"Account xpub (depth {len(path)}):", account_xpub)
+        seed = bip39_seed_from_mnemonic(mnemonic, args.passphrase)
+        addresses = print_bip32_wallet(seed, args.bip39_derivation, args.network, args.passphrase, args.count,
+                                       'BIP39', 'Entropy', entropy_note, entropy_bytes.hex())
     else:
         mnemonic = electrum_mnemonic(entropy_bytes, wordlist, args.electrum_version)
         print(f"Mnemonic (Electrum {args.electrum_version}):", mnemonic)
-        addresses, master_key, master_chain, _, _, _ = derive_electrum_addresses(mnemonic, args.electrum_version, args.count, args.network)
+        addresses, master_key, master_chain, _, _, _ = derive_electrum_addresses(mnemonic, args.electrum_version, args.count, args.network, args.passphrase)
 
         if args.electrum_version in ('standard', '2fa'):
             recv_path, change_path, script = 'm/0/i', 'm/1/i', 'p2pkh'
         else:
             recv_path, change_path, script = "m/0'/0/i", "m/0'/1/i", 'p2wpkh'
-        print(f"\nWallet: Electrum {args.electrum_version} ({script}) | network {args.network} | passphrase: none")
+        pp = 'none' if not args.passphrase else '<set>'
+        print(f"\nWallet: Electrum {args.electrum_version} ({script}) | network {args.network} | passphrase: {pp}")
         print(f"  Derivation: receiving {recv_path} | change {change_path}")
         print(f"  Entropy {entropy_note}: {entropy_bytes.hex()}")
 
@@ -452,6 +732,32 @@ def main():
     if addresses:
         print("\nFirst %d addresses:" % len(addresses))
         for i, addr in enumerate(addresses): print(f"{i:2d}: {addr}")
+
+def resolve_entropy(args, required_bits):
+    """Build the effective entropy of exactly `required_bits` from the --bits* options (or random)."""
+    if args.bits is not None:
+        user_value, user_bits, source = *binary_to_bits(args.bits), '--bits'
+    elif args.bits6 is not None:
+        user_value, user_bits, source = *base6_to_bits(args.bits6), '--bits6'
+    elif args.bitsphrase is not None:
+        user_value, user_bits, source = *phrase_to_bits(args.bitsphrase), '--bitsphrase'
+    elif args.bitshex is not None:
+        user_value, user_bits, source = *hex_to_bits(args.bitshex), '--bitshex'
+    else:
+        user_value, user_bits, source = None, 0, None
+
+    if user_value is None:
+        return random_entropy_bytes(required_bits // 8), f"({required_bits} bits, /dev/random)"
+    if user_bits == required_bits:
+        entropy_value = user_value
+        note = f"{user_bits} user bits"
+    else:
+        entropy_value = complete_entropy(user_value, user_bits, required_bits)
+        if user_bits > required_bits:
+            note = f"truncated from {user_bits} to {required_bits} bits"
+        else:
+            note = f"{user_bits} user bits + {required_bits - user_bits} random bits"
+    return entropy_value.to_bytes(required_bits // 8, 'big'), f"({required_bits} bits, from {source}, {note})"
 
 if __name__ == '__main__':
     main()
