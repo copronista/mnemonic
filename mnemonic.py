@@ -12,6 +12,7 @@ __email__ = "copronista@proton.me"
 import argparse
 import hashlib
 import hmac
+import json
 import os
 import re
 import sys
@@ -620,26 +621,69 @@ def slip39_recover(shares, passphrase, wordlist):
     ems = slip39_recover_secret(group_threshold, group_secrets)
     return slip39_decrypt_master_secret(ems, passphrase, iteration_exponent, identifier, extendable)
 
-def print_bip32_wallet(seed, derivation, network, passphrase, count, type_label, entropy_label, entropy_note, entropy_hex):
-    """Derive and print the BIP32 wallet for a seed (BIP39 seed or SLIP-39 master secret)."""
+def build_bip32_wallet(seed, derivation, network, passphrase, count):
+    """Derive BIP32 wallet and return addresses, keys, and wallet metadata."""
     addresses, master_key, master_chain, account_key, account_chain, path = derive_bip32_wallet(seed, derivation, count, network)
     script = {'bip44': 'p2pkh', 'bip49': 'p2sh-segwit', 'bip84': 'segwit'}[derivation]
-    pp = 'none' if not passphrase else '<set>'
-    print(f"\nWallet: {type_label} {derivation} ({script}) | network {network} | passphrase: {pp}")
-    print(f"  Derivation: receiving {format_path(path + [0])}/i | change {format_path(path + [1])}/i")
-    print(f"  {entropy_label} {entropy_note}: {entropy_hex}")
-
     net_key = 'testnet' if network != 'mainnet' else 'mainnet'
     v_prv, v_pub = VERSION_BYTES.get(derivation, VERSION_BYTES['default'])[net_key]
     parent_key, parent_chain = bip32_derive_path(master_key, master_chain, path[:-1])
     account_parent_fp = bip32_fingerprint_from_privkey(parent_key)
     account_xprv = bip32_xprv(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_prv)
     account_xpub = bip32_xpub(account_key, account_chain, len(path), account_parent_fp, path[-1], ver_bytes=v_pub)
-    print(f"\nAccount xprv (depth {len(path)}):", account_xprv)
-    print(f"Account xpub (depth {len(path)}):", account_xpub)
-    return addresses
+    return {
+        'script': script,
+        'derivation': {'receiving': format_path(path + [0]) + '/i', 'change': format_path(path + [1]) + '/i'},
+        'account_xprv': account_xprv,
+        'account_xpub': account_xpub,
+        'addresses': addresses,
+    }
+
 
 # ---------- Main ----------
+def print_human(result, args):
+    """Print result dict as human-readable text."""
+    t = result['type']
+    pp = 'none' if result['passphrase'] is None else '<set>'
+
+    if t == 'electrum':
+        print(f"Mnemonic (Electrum {result['version']}):", result['mnemonic'])
+        print(f"\nWallet: Electrum {result['version']} ({result['wallet']['script']}) | network {result['network']} | passphrase: {pp}")
+        print(f"  Derivation: receiving {result['wallet']['derivation']['receiving']} | change {result['wallet']['derivation']['change']}")
+        print(f"  Entropy {result['entropy']['note']}: {result['entropy']['hex']}")
+        if result['wallet'].get('master_xprv'):
+            print("\nMaster xprv:", result['wallet']['master_xprv'])
+            print("Master xpub:", result['wallet']['master_xpub'])
+
+    elif t == 'bip39':
+        print("Mnemonic (BIP39):", result['mnemonic'])
+        print(f"\nWallet: BIP39 {result['derivation']} ({result['wallet']['script']}) | network {result['network']} | passphrase: {pp}")
+        print(f"  Derivation: receiving {result['wallet']['derivation']['receiving']} | change {result['wallet']['derivation']['change']}")
+        print(f"  Entropy {result['entropy']['note']}: {result['entropy']['hex']}")
+        print(f"\nAccount xprv (depth 3):", result['wallet']['account_xprv'])
+        print(f"Account xpub (depth 3):", result['wallet']['account_xpub'])
+
+    elif t == 'slip39':
+        if 'scheme' in result:
+            print(f"Mnemonic (SLIP-39 {result['scheme']}):")
+            for i, s in enumerate(result['shares'], 1):
+                print(f"  Share {i}: {s}")
+        else:
+            print(f"Recovered SLIP-39 master secret from {result['recovered_from']} shares:")
+        print(f"\nWallet: SLIP-39 {result['derivation']} ({result['wallet']['script']}) | network {result['network']} | passphrase: {pp}")
+        print(f"  Derivation: receiving {result['wallet']['derivation']['receiving']} | change {result['wallet']['derivation']['change']}")
+        if 'entropy' in result:
+            print(f"  Master secret {result['entropy']['note']}: {result['entropy']['hex']}")
+        else:
+            ms = result['master_secret']
+            print(f"  Master secret ({len(ms) * 4} bits, from shares): {ms}")
+        print(f"\nAccount xprv (depth 3):", result['wallet']['account_xprv'])
+        print(f"Account xpub (depth 3):", result['wallet']['account_xpub'])
+
+    if result['addresses']:
+        print(f"\nFirst {len(result['addresses'])} addresses:")
+        for i, addr in enumerate(result['addresses']): print(f"{i:2d}: {addr}")
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate an Electrum, BIP39 or SLIP-39 mnemonic and derive its first receiving addresses and extended keys.',
@@ -666,7 +710,14 @@ def main():
     parser.add_argument('--slip39-wordlist', default='slip39_english.txt', help='1024-word SLIP-39 list used for encoding')
     parser.add_argument('--slip39-recover', action='append', default=None, metavar='MNEMONIC',
                         help='recover a master secret from a SLIP-39 share; repeat for each share')
+    parser.add_argument('--json', action='store_true', help='output result as JSON instead of human-readable text')
     args = parser.parse_args()
+
+    result = {
+        'network': args.network,
+        'passphrase': args.passphrase or None,
+        'addresses': [],
+    }
 
     if args.type == 'slip39':
         slip_fallback = slip39_bundled_wordlist_path() if args.slip39_wordlist == 'slip39_english.txt' else None
@@ -674,10 +725,13 @@ def main():
 
         if args.slip39_recover:
             ms = slip39_recover(args.slip39_recover, args.passphrase, slip_wordlist)
-            print(f"Recovered SLIP-39 master secret from {len(args.slip39_recover)} shares:")
-            print(f"  Master secret: {ms.hex()}")
-            addresses = print_bip32_wallet(ms, args.bip39_derivation, args.network, args.passphrase, args.count,
-                                           'SLIP-39', 'Master secret', f"({len(ms) * 8} bits, from shares)", ms.hex())
+            result['type'] = 'slip39'
+            result['recovered_from'] = len(args.slip39_recover)
+            result['master_secret'] = ms.hex()
+            result['derivation'] = args.bip39_derivation
+            wallet = build_bip32_wallet(ms, args.bip39_derivation, args.network, args.passphrase, args.count)
+            result['wallet'] = {k: v for k, v in wallet.items() if k != 'addresses'}
+            result['addresses'] = wallet['addresses']
         else:
             required_bits = SLIP39_WORD_COUNTS.get(args.slip39_words, 32) * 8
             entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
@@ -686,52 +740,66 @@ def main():
             scheme = f"{args.slip39_threshold}-of-{args.slip39_shares}"
             if args.slip39_groups > 1:
                 scheme = f"{args.slip39_group_threshold}-of-{args.slip39_groups} groups, each {scheme}"
-            print(f"Mnemonic (SLIP-39 {scheme}):")
-            for i, s in enumerate(shares, 1):
-                print(f"  Share {i}: {s}")
-            addresses = print_bip32_wallet(entropy_bytes, args.bip39_derivation, args.network, args.passphrase, args.count,
-                                           'SLIP-39', 'Master secret', entropy_note, entropy_bytes.hex())
-        if addresses:
-            print("\nFirst %d addresses:" % len(addresses))
-            for i, addr in enumerate(addresses): print(f"{i:2d}: {addr}")
-        return
-
-    fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
-    wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
-    required_bits = BIP39_WORD_COUNTS.get(args.bip39_words, 32) * 8 if args.type == 'bip39' else 132
-    entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
-    net_key = 'testnet' if args.network != 'mainnet' else 'mainnet'
-
-    if args.type == 'bip39':
-        mnemonic = bip39_mnemonic(entropy_bytes, wordlist)
-        print("Mnemonic (BIP39):", mnemonic)
-        seed = bip39_seed_from_mnemonic(mnemonic, args.passphrase)
-        addresses = print_bip32_wallet(seed, args.bip39_derivation, args.network, args.passphrase, args.count,
-                                       'BIP39', 'Entropy', entropy_note, entropy_bytes.hex())
+            result['type'] = 'slip39'
+            result['scheme'] = scheme
+            result['shares'] = shares
+            result['derivation'] = args.bip39_derivation
+            result['entropy'] = _parse_entropy_note(entropy_note, entropy_bytes.hex())
+            wallet = build_bip32_wallet(entropy_bytes, args.bip39_derivation, args.network, args.passphrase, args.count)
+            result['wallet'] = {k: v for k, v in wallet.items() if k != 'addresses'}
+            result['addresses'] = wallet['addresses']
     else:
-        mnemonic = electrum_mnemonic(entropy_bytes, wordlist, args.electrum_version)
-        print(f"Mnemonic (Electrum {args.electrum_version}):", mnemonic)
-        addresses, master_key, master_chain, _, _, _ = derive_electrum_addresses(mnemonic, args.electrum_version, args.count, args.network, args.passphrase)
+        fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
+        wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
+        required_bits = BIP39_WORD_COUNTS.get(args.bip39_words, 32) * 8 if args.type == 'bip39' else 132
+        entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
 
-        if args.electrum_version in ('standard', '2fa'):
-            recv_path, change_path, script = 'm/0/i', 'm/1/i', 'p2pkh'
+        if args.type == 'bip39':
+            mnemonic = bip39_mnemonic(entropy_bytes, wordlist)
+            result['type'] = 'bip39'
+            result['mnemonic'] = mnemonic
+            result['derivation'] = args.bip39_derivation
+            result['entropy'] = _parse_entropy_note(entropy_note, entropy_bytes.hex())
+            seed = bip39_seed_from_mnemonic(mnemonic, args.passphrase)
+            wallet = build_bip32_wallet(seed, args.bip39_derivation, args.network, args.passphrase, args.count)
+            result['wallet'] = {k: v for k, v in wallet.items() if k != 'addresses'}
+            result['addresses'] = wallet['addresses']
         else:
-            recv_path, change_path, script = "m/0'/0/i", "m/0'/1/i", 'p2wpkh'
-        pp = 'none' if not args.passphrase else '<set>'
-        print(f"\nWallet: Electrum {args.electrum_version} ({script}) | network {args.network} | passphrase: {pp}")
-        print(f"  Derivation: receiving {recv_path} | change {change_path}")
-        print(f"  Entropy {entropy_note}: {entropy_bytes.hex()}")
+            mnemonic = electrum_mnemonic(entropy_bytes, wordlist, args.electrum_version)
+            addresses, master_key, master_chain, _, _, _ = derive_electrum_addresses(mnemonic, args.electrum_version, args.count, args.network, args.passphrase)
+            if args.electrum_version in ('standard', '2fa'):
+                recv_path, change_path, script = 'm/0/i', 'm/1/i', 'p2pkh'
+            else:
+                recv_path, change_path, script = "m/0'/0/i", "m/0'/1/i", 'p2wpkh'
+            net_key = 'testnet' if args.network != 'mainnet' else 'mainnet'
+            wallet = {'script': script, 'derivation': {'receiving': recv_path, 'change': change_path}}
+            if master_key is not None:
+                v_prv, v_pub = (VERSION_BYTES['bip84'] if args.electrum_version == 'segwit' else VERSION_BYTES['bip44'])[net_key]
+                wallet['master_xprv'] = bip32_xprv(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=v_prv)
+                wallet['master_xpub'] = bip32_xpub(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=v_pub)
+            result['type'] = 'electrum'
+            result['version'] = args.electrum_version
+            result['mnemonic'] = mnemonic
+            result['entropy'] = _parse_entropy_note(entropy_note, entropy_bytes.hex())
+            result['wallet'] = wallet
+            result['addresses'] = addresses
 
-        if master_key is not None:
-            v_prv, v_pub = (VERSION_BYTES['bip84'] if args.electrum_version == 'segwit' else VERSION_BYTES['bip44'])[net_key]
-            master_xprv = bip32_xprv(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=v_prv)
-            master_xpub = bip32_xpub(master_key, master_chain, 0, b'\x00\x00\x00\x00', 0, ver_bytes=v_pub)
-            print("\nMaster xprv:", master_xprv)
-            print("Master xpub:", master_xpub)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print_human(result, args)
 
-    if addresses:
-        print("\nFirst %d addresses:" % len(addresses))
-        for i, addr in enumerate(addresses): print(f"{i:2d}: {addr}")
+def _parse_entropy_note(note, hex_str):
+    """Parse '128/132 bits (from --bitshex, 128 user + 4 random)' into structured dict."""
+    import re
+    m = re.match(r'(\d+)/(\d+) bits \(([^)]+)\)', note)
+    if not m:
+        return {'hex': hex_str, 'user_bits': 0, 'required_bits': 0, 'source': '', 'detail': ''}
+    user_bits, required_bits, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+    parts = rest.split(', ', 1)
+    source = parts[0]
+    detail = parts[1] if len(parts) > 1 else ''
+    return {'hex': hex_str, 'user_bits': user_bits, 'required_bits': required_bits, 'source': source, 'note': note, 'detail': detail}
 
 def resolve_entropy(args, required_bits):
     """Build the effective entropy of exactly `required_bits` from the --bits* options (or random)."""
