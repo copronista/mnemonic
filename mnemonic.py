@@ -698,7 +698,7 @@ def main():
 
     fallback = bundled_wordlist_path() if args.wordlist_file == 'english.txt' else None
     wordlist = load_wordlist(args.wordlist_file, fallback=fallback)
-    required_bits = BIP39_WORD_COUNTS.get(args.bip39_words, 32) * 8 if args.type == 'bip39' else 256
+    required_bits = BIP39_WORD_COUNTS.get(args.bip39_words, 32) * 8 if args.type == 'bip39' else 132
     entropy_bytes, entropy_note = resolve_entropy(args, required_bits)
     net_key = 'testnet' if args.network != 'mainnet' else 'mainnet'
 
@@ -735,6 +735,7 @@ def main():
 
 def resolve_entropy(args, required_bits):
     """Build the effective entropy of exactly `required_bits` from the --bits* options (or random)."""
+    byte_length = (required_bits + 7) // 8
     if args.bits is not None:
         user_value, user_bits, source = *binary_to_bits(args.bits), '--bits'
     elif args.bits6 is not None:
@@ -747,17 +748,18 @@ def resolve_entropy(args, required_bits):
         user_value, user_bits, source = None, 0, None
 
     if user_value is None:
-        return random_entropy_bytes(required_bits // 8), f"{0}/{required_bits} bits (/dev/random)"
+        return random_entropy_bytes(byte_length), f"{0}/{required_bits} bits (/dev/random)"
+    eff = min(user_bits, required_bits)
     if user_bits == required_bits:
         entropy_value = user_value
         detail = ''
     else:
         entropy_value = complete_entropy(user_value, user_bits, required_bits)
         if user_bits > required_bits:
-            detail = f', truncated from {user_bits}'
+            detail = ''
         else:
             detail = f', {user_bits} user + {required_bits - user_bits} random'
-    return entropy_value.to_bytes(required_bits // 8, 'big'), f"{user_bits}/{required_bits} bits (from {source}{detail})"
+    return entropy_value.to_bytes(byte_length, 'big'), f"{eff}/{required_bits} bits (from {source}{detail})"
 
 if __name__ == '__main__':
     main()
