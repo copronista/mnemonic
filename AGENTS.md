@@ -61,3 +61,12 @@ NETWORK=regtest BITS=<64 hex chars> ./test_against_electrum.sh
 - Some inline comments in `mnemonic.py` are Italian; keep all new code and comments in English.
 - SLIP-39 is not Electrum's native seed format. SLIP-39 shares recover a master secret which is fed into BIP32 via the standard BIP43 derivation (same as BIP39), not Electrum's PBKDF2-based seed derivation.
 - The official Trezor test vectors (`slip39_vectors.json`) use passphrase `"TREZOR"`, not empty.
+
+## GitHub API limits (unauthenticated)
+
+- **core** (REST): 60 requests/hour
+- **search**: 10 requests/minute
+- **code_search**: 60 requests/hour
+- **graphql**: requires auth token (0 unauthenticated)
+
+Prefer `gh` CLI over raw `curl` for GitHub operations — it handles auth and rate limits automatically.
