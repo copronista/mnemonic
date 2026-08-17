@@ -102,9 +102,9 @@ roundtrip() {
         --slip39-groups "$groups" --slip39-group-threshold "$gt" \
         ${passphrase:+--passphrase "$passphrase"} --count 1 2>/dev/null)"
     local ms
-    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret ([^)]*): //p')"
-    mapfile -t shares_list < <(printf '%s\n' "$out" | sed -n 's/^  Share [0-9][0-9]*: //p')
-    if [[ -z "$ms" || "${#shares_list[@]}" -ne "$((groups * shares))" ]]; then
+    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret [^:]*: //p')"
+    mapfile -t share_lines < <(printf '%s\n' "$out" | sed -n 's/^  Share [0-9][0-9]*: //p')
+    if [[ -z "$ms" || "${#share_lines[@]}" -ne "$((groups * shares))" ]]; then
         FAIL=$((FAIL + 1))
         echo "FAIL: roundtrip/$name (bad script output)"
         return
@@ -115,12 +115,12 @@ roundtrip() {
     for ((g = 0; g < gt; g++)); do
         for ((s = 0; s < threshold; s++)); do
             idx=$((g * shares + s))
-            pick+=(--slip39-recover "${shares_list[$idx]}")
+            pick+=(--slip39-recover "${share_lines[$idx]}")
         done
     done
     local rec
     rec="$("$ELECTRUM_PYTHON" "$MNEMONIC_PY" --type slip39 "${pick[@]}" \
-        ${passphrase:+--passphrase "$passphrase"} --count 1 2>/dev/null | sed -n 's/^  Master secret ([^)]*): //p')"
+        ${passphrase:+--passphrase "$passphrase"} --count 1 2>/dev/null | sed -n 's/^  Master secret [^:]*: //p')"
     if [[ "$rec" == "$ms" ]]; then
         PASS=$((PASS + 1))
         echo "PASS: roundtrip/$name"
@@ -149,7 +149,7 @@ electrum_crosscheck() {
         --slip39-words "$words" --slip39-shares "$shares" --slip39-threshold "$threshold" \
         --slip39-groups "$groups" --slip39-group-threshold "$gt" \
         ${passphrase:+--passphrase "$passphrase"} --count 1 2>/dev/null)"
-    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret ([^)]*): //p')"
+    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret [^:]*: //p')"
     mapfile -t shares_list < <(printf '%s\n' "$out" | sed -n 's/^  Share [0-9][0-9]*: //p')
     if [[ -z "$ms" ]]; then
         FAIL=$((FAIL + 1))

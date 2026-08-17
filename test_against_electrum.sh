@@ -202,7 +202,7 @@ run_slip39_case() {
         --count "$COUNT" --network "$NETWORK" \
         --wordlist-file "$SCRIPT_DIR/english.txt" \
         --slip39-wordlist "$SCRIPT_DIR/slip39_english.txt" 2>/dev/null)"
-    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret ([^)]*): //p')"
+    ms="$(printf '%s\n' "$out" | sed -n 's/^  Master secret [^:]*: //p')"
     mapfile -t share_lines < <(printf '%s\n' "$out" | sed -n 's/^  Share [0-9][0-9]*: //p')
     printf '%s\n' "$out" | sed -n 's/^ *[0-9][0-9]*: //p' >"$ELDIR/expected"
     if [[ -z "$ms" || "${#share_lines[@]}" -ne 3 ]]; then

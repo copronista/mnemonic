@@ -747,17 +747,17 @@ def resolve_entropy(args, required_bits):
         user_value, user_bits, source = None, 0, None
 
     if user_value is None:
-        return random_entropy_bytes(required_bits // 8), f"({required_bits} bits, /dev/random)"
+        return random_entropy_bytes(required_bits // 8), f"{0}/{required_bits} bits (/dev/random)"
     if user_bits == required_bits:
         entropy_value = user_value
-        note = f"{user_bits} user bits"
+        detail = ''
     else:
         entropy_value = complete_entropy(user_value, user_bits, required_bits)
         if user_bits > required_bits:
-            note = f"truncated from {user_bits} to {required_bits} bits"
+            detail = f', truncated from {user_bits}'
         else:
-            note = f"{user_bits} user bits + {required_bits - user_bits} random bits"
-    return entropy_value.to_bytes(required_bits // 8, 'big'), f"({required_bits} bits, from {source}, {note})"
+            detail = f', {user_bits} user + {required_bits - user_bits} random'
+    return entropy_value.to_bytes(required_bits // 8, 'big'), f"{user_bits}/{required_bits} bits (from {source}{detail})"
 
 if __name__ == '__main__':
     main()
