@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
@@ -222,11 +223,6 @@ def _check_chars(s, allowed, base_name):
 def binary_to_bits(s):
     _check_chars(s, '01', 'bits')
     return int(s, 2), len(s)
-
-def base6_to_bits(s):
-    _check_chars(s, '012345', 'bits6')
-    n = int(s, 6)
-    return n, n.bit_length()
 
 def hex_to_bits(s):
     if s.startswith(('0x', '0X')):
@@ -807,10 +803,11 @@ def main():
                'Without any --bits* option, random entropy is used.')
     entropy_group = parser.add_mutually_exclusive_group()
     entropy_group.add_argument('--bits', help='binary digits, e.g. "1010"')
-    entropy_group.add_argument('--bits6', help='base-6 digits, e.g. "2103"')
     entropy_group.add_argument('--bitsphrase', help='UTF-8 text encoded as its bytes')
     entropy_group.add_argument('--bitshex', help='hex digits, optional 0x prefix, e.g. "0x1a2b"')
     entropy_group.add_argument('--bitsmnemonic', help='partial mnemonic with _ for unknown words, e.g. "abandon _ mimic ..."')
+    entropy_group.add_argument('--dice', type=int, metavar='FACES',
+                               help='interactive dice mode: enter rolls one at a time (faces on the die)')
     parser.add_argument('--type', required=True, choices=['electrum', 'bip39', 'slip39'], help='mnemonic algorithm')
     parser.add_argument('--electrum-version', default='segwit', choices=ELECTRUM_VERSIONS.keys(), help='Electrum seed version')
     parser.add_argument('--bip39-derivation', default='bip84', choices=['bip44', 'bip49', 'bip84'], help='derivation scheme; sets key versions and address type')
@@ -965,17 +962,73 @@ def _parse_entropy_note(note, hex_str):
     detail = parts[1] if len(parts) > 1 else ''
     return {'hex': hex_str, 'user_bits': user_bits, 'required_bits': required_bits, 'source': source, 'note': note, 'detail': detail}
 
+def collect_dice_entropy(faces, required_bits):
+    """Interactively collect die rolls and accumulate entropy using a bit-stream approach.
+
+    Each roll is prompted one at a time. The entered value (1..faces) is
+    decremented by 1 (zero-based) and accumulated in base-faces. Bits are
+    extracted from the accumulator as soon as enough whole bits of entropy
+    have accumulated, minimizing waste for non-power-of-2 dice.
+    """
+    if faces < 2:
+        raise ValueError("Dice must have at least 2 faces.")
+    entropy_per_roll = math.log2(faces)
+    rolls_estimate = math.ceil(required_bits / entropy_per_roll)
+    print(f"\nDice mode: {faces} faces, ~{entropy_per_roll:.2f} bits/roll, "
+          f"need {required_bits} bits (~{rolls_estimate} rolls)\n")
+
+    acc = 0
+    entropy = 0.0
+    bits_extracted = 0
+    roll_count = 0
+
+    while bits_extracted < required_bits:
+        while True:
+            try:
+                raw = input(f"Roll #{roll_count + 1}: enter 1-{faces} (or 'q' to quit): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                sys.exit(1)
+            if raw.lower() == 'q':
+                print("Aborted.")
+                sys.exit(1)
+            if not raw.isdigit():
+                print(f"  Invalid input: enter a number between 1 and {faces}.")
+                continue
+            value = int(raw)
+            if value < 1 or value > faces:
+                print(f"  Invalid input: enter a number between 1 and {faces}.")
+                continue
+            break
+
+        value -= 1  # dice start at 1, bits start at 0
+        roll_count += 1
+        acc = acc * faces + value
+        entropy += entropy_per_roll
+
+        while math.floor(entropy) > bits_extracted:
+            bits_extracted += 1
+
+        remaining = required_bits - bits_extracted
+        print(f"  -> Roll #{roll_count}: {value + 1}  |  rolls: {roll_count}/{rolls_estimate}  |  "
+              f"bits: {bits_extracted}/{required_bits}"
+              + (f"  |  remaining: {remaining}" if remaining > 0 else "  |  COMPLETE"))
+
+    print()
+    return acc, bits_extracted
+
+
 def resolve_entropy(args, required_bits):
     """Build the effective entropy of exactly `required_bits` from the --bits* options (or random)."""
     byte_length = (required_bits + 7) // 8
     if args.bits is not None:
         user_value, user_bits, source = *binary_to_bits(args.bits), '--bits'
-    elif args.bits6 is not None:
-        user_value, user_bits, source = *base6_to_bits(args.bits6), '--bits6'
     elif args.bitsphrase is not None:
         user_value, user_bits, source = *phrase_to_bits(args.bitsphrase), '--bitsphrase'
     elif args.bitshex is not None:
         user_value, user_bits, source = *hex_to_bits(args.bitshex), '--bitshex'
+    elif args.dice is not None:
+        user_value, user_bits, source = *collect_dice_entropy(args.dice, required_bits), '--dice'
     else:
         user_value, user_bits, source = None, 0, None
 

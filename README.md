@@ -11,11 +11,12 @@ No dependencies, no build. Runs on Python 3 with the standard library only.
 
 ```bash
 python3 mnemonic.py --bitshex <hex> --type <electrum|bip39|slip39>
+python3 mnemonic.py --dice <faces> --type <electrum|bip39|slip39>
 ```
 
-Exactly one entropy option (`--bits*`) may be given. If none is given, random
-entropy is read from `/dev/random` (fallback `os.urandom`). Padding and
-truncation always happen **at bit level**:
+Exactly one entropy option (`--bits*`, `--dice`, or `--bitsmnemonic`) may be
+given. If none is given, random entropy is read from `/dev/random` (fallback
+`os.urandom`). Padding and truncation always happen **at bit level**:
 
 - input **shorter** than required → cryptographically secure random bits appended
 - input **longer** → truncated to the required length
@@ -30,9 +31,9 @@ entropy in hex, so results are reproducible.
 | Option | Description |
 | --- | --- |
 | `--bits` | Binary digits (`0`/`1`), MSB-first. |
-| `--bits6` | Base-6 digits (`0`-`5`), treated as a big-endian number. |
 | `--bitsphrase` | UTF-8 text, encoded as its bytes. |
 | `--bitshex` | Hex digits, optional `0x` prefix; leading zero bits kept. |
+| `--dice` | Interactive dice mode: enter rolls one at a time; supply the number of faces. |
 | `--type` | `electrum`, `bip39`, or `slip39` (required). |
 | `--passphrase` | BIP39/SLIP-39 passphrase or Electrum extension word. |
 | `--electrum-version` | `standard` \| `segwit` \| `2fa` \| `2fa_segwit` (default `segwit`). |
@@ -60,8 +61,8 @@ python3 mnemonic.py \
 # Electrum segwit from a short phrase (padded with random bits)
 python3 mnemonic.py --bitsphrase "my seed text" --type electrum
 
-# BIP39, 12 words, testnet, segwit addresses
-python3 mnemonic.py --bits6 2103 --type bip39 --bip39-words 12 --network testnet
+# BIP39, 12 words, testnet, dice entropy (d6)
+python3 mnemonic.py --dice 6 --type bip39 --bip39-words 12 --network testnet
 
 # SLIP-39 2-of-3, 128-bit master secret
 python3 mnemonic.py \

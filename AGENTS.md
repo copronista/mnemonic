@@ -6,13 +6,14 @@ Single-file, pure-stdlib Python CLI: generates Electrum (4.8), BIP39, or SLIP-39
 
 ```bash
 python3 mnemonic.py --bitshex <hex> --type <electrum|bip39|slip39>
+python3 mnemonic.py --dice <faces> --type <electrum|bip39|slip39>
 ```
 
 - Exactly one entropy option may be given; they are mutually exclusive. If none is given, random entropy is read from `/dev/random` (fallback: `os.urandom`) and printed in hex.
   - `--bits` — binary digits (`0`/`1`), any length; MSB-first, kept exactly as given (no byte alignment).
-  - `--bits6` — base-6 digits (`0`-`5`), any length; treated as a big-endian number, its bit length is the number of significant bits.
   - `--bitsphrase` — UTF-8 text, any length; encoded as UTF-8 bits.
   - `--bitshex` — hex digits (optional `0x` prefix), any length; leading zero bits are preserved.
+  - `--dice FACES` — interactive dice mode; enter rolls one at a time (1..faces). Uses a streaming entropy accumulator: each roll adds `log₂(faces)` bits, and whole bits are extracted as soon as they accumulate, minimizing waste for non-power-of-2 dice.
 - Entropy length is free. Padding/truncation always happens **at bit level**: if the input is **shorter** than the size the selected algorithm needs (BIP39 word count × 8 bits, or 256 bits for Electrum), cryptographically secure random bits are appended after the user bits; if **longer**, it is truncated to the required number of bits. The final entropy always has exactly the required length (a multiple of 8). The `Entropy` line reports the source and the user/padding or truncation split in bits, and prints the effective entropy in hex so the wallet is reproducible.
 - `--type` is required (`electrum` | `bip39` | `slip39`).
 - `--electrum-version` (default `segwit`): `standard|segwit|2fa|2fa_segwit`.
